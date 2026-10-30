@@ -1,7 +1,6 @@
 // Copy this file to config.js and fill in your own values.
 // Keep config.js private; it is excluded by .gitignore.
 module.exports = {
-  PORT: 3000,
   BASE_URL: "https://YOUR-WEB-DOMAIN",
   REDIRECT_URI: "https://YOUR-WEB-DOMAIN/auth/callback",
   DISCORD_CLIENT_ID: "YOUR_DISCORD_CLIENT_ID",
