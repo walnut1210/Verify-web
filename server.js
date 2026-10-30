@@ -204,4 +204,5 @@ app.use((err, req, res, next) => {
   res.status(500).send("サーバーエラーが発生しました。");
 });
 
-app.listen(config.PORT, () => console.log(`Web server listening on ${config.PORT}`));
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Web server listening on ${port}`));
