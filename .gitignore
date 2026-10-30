@@ -1,0 +1,5 @@
+config.js
+data/
+*.sqlite
+node_modules/
+npm-debug.log*
