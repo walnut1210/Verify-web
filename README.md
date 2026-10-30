@@ -9,6 +9,9 @@ Discord OAuth2を利用する認証Webアプリケーションです。Verify-bo
 4. Discord Developer PortalのRedirect URIに `https://YOUR-WEB-DOMAIN/auth/callback` を登録します。
 5. `npm install` 後、`npm start` で起動します。
 
+## ポート設定
+起動ポートは `process.env.PORT || 3000` で取得します。ホスティング環境が `PORT` を指定した場合はその値を使用し、指定がないローカル環境では `3000` を使用します。`PORT` 以外の環境変数は参照せず、その他の設定は `config.js` で管理します。
+
 ## OAuth2
 使用scopeは `identify guilds.join`。stateをセッションに保存してコールバックで照合します。OAuthアクセストークンはBot APIにサーバー側から渡し、WebhookやDBには保存しません。
 
