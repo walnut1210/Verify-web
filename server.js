@@ -124,6 +124,8 @@ app.get("/auth/callback", authLimiter, async (req, res) => {
 
 app.get("/internal/jobs/next", internalLimiter, requireBotAuth, (req, res) => {
   const now = Date.now();
+  // A worker that crashed on its final attempt must not leave a token-bearing job forever.
+  db.prepare("UPDATE verification_jobs SET status='failed', encrypted_token='', iv='', auth_tag='', lease_until=NULL, last_error='worker_lease_expired' WHERE status='processing' AND attempts >= ? AND lease_until < ?").run(MAX_ATTEMPTS, now);
   const claim = db.transaction(() => {
     const job = db.prepare("SELECT * FROM verification_jobs WHERE attempts < ? AND (status = 'pending' OR (status = 'processing' AND lease_until < ?)) ORDER BY created_at ASC LIMIT 1").get(MAX_ATTEMPTS, now);
     if (!job) return null;
