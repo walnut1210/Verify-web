@@ -76,7 +76,11 @@ app.get("/auth/discord", authLimiter, (req, res, next) => {
   const state = crypto.randomBytes(32).toString("hex");
   req.session.oauthState = state;
   req.session.save(err => {
-    if (err) return next(err);
+    if (err) {
+      console.error("OAuth session save failed:", err.message);
+      return next(err);
+    }
+    console.log("OAuth start diagnostics:", JSON.stringify({ secure: req.secure, forwardedProto: req.get("x-forwarded-proto") || null, host: req.get("host") || null, cookieReceived: Boolean(req.headers.cookie), sessionStateSaved: typeof req.session.oauthState === "string" }));
     const params = new URLSearchParams({ client_id: config.DISCORD_CLIENT_ID, response_type: "code", redirect_uri: config.REDIRECT_URI, scope: SCOPES, state, prompt: "consent" });
     res.redirect("https://discord.com/oauth2/authorize?" + params.toString());
   });
@@ -85,6 +89,7 @@ app.get("/auth/discord", authLimiter, (req, res, next) => {
 app.get("/auth/callback", authLimiter, async (req, res) => {
   const { code, state, error } = req.query;
   const expectedState = req.session.oauthState;
+  console.log("OAuth callback diagnostics:", JSON.stringify({ secure: req.secure, forwardedProto: req.get("x-forwarded-proto") || null, host: req.get("host") || null, cookieReceived: Boolean(req.headers.cookie), codePresent: typeof code === "string", statePresent: typeof state === "string", sessionStatePresent: typeof expectedState === "string" }));
   delete req.session.oauthState;
   if (error) return res.status(400).send("Discord認証がキャンセルされました。");
   if (typeof code !== "string" || typeof state !== "string" || typeof expectedState !== "string" ||
@@ -114,7 +119,13 @@ app.get("/auth/callback", authLimiter, async (req, res) => {
       if (err) return res.status(500).send("セッションを更新できませんでした。");
       req.session.verifiedUserId = user.id;
       req.session.verificationJobId = jobId;
-      req.session.save(() => res.redirect("/success.html"));
+      req.session.save(saveErr => {
+      if (saveErr) {
+        console.error("OAuth completion session save failed:", saveErr.message);
+        return res.status(500).send("セッションを保存できませんでした。");
+      }
+      res.redirect("/success.html");
+    });
     });
   } catch (err) {
     console.error("OAuth callback error:", err.message);
