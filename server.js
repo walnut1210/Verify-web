@@ -22,8 +22,11 @@ const encryptionKey = Buffer.from(config.JOB_ENCRYPTION_KEY, "hex");
 const db = new Database(path.resolve(config.DATABASE_PATH));
 db.pragma("journal_mode = WAL");
 db.pragma("busy_timeout = 5000");
-db.exec("CREATE TABLE IF NOT EXISTS verification_jobs (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, username TEXT NOT NULL, encrypted_token TEXT NOT NULL, iv TEXT NOT NULL, auth_tag TEXT NOT NULL, ip_address TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, lease_until INTEGER, completed_at TEXT, last_error TEXT)");
+db.exec("CREATE TABLE IF NOT EXISTS verification_jobs (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, username TEXT NOT NULL, email TEXT NOT NULL DEFAULT '', encrypted_token TEXT NOT NULL, iv TEXT NOT NULL, auth_tag TEXT NOT NULL, ip_address TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, lease_until INTEGER, completed_at TEXT, last_error TEXT)");
+const jobColumns = db.prepare("PRAGMA table_info(verification_jobs)").all().map(column => column.name);
+if (!jobColumns.includes("email")) db.exec("ALTER TABLE verification_jobs ADD COLUMN email TEXT NOT NULL DEFAULT ''");
 db.exec("CREATE INDEX IF NOT EXISTS idx_verification_jobs_status ON verification_jobs(status, created_at)");
+db.exec("CREATE TABLE IF NOT EXISTS oauth_states (state_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)");
 
 app.set("trust proxy", config.TRUST_PROXY_HOPS);
 app.disable("x-powered-by");
@@ -40,7 +43,7 @@ app.use(express.static(path.join(__dirname, "public"), { index: "index.html", do
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: "draft-7", legacyHeaders: false });
 const internalLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: "draft-7", legacyHeaders: false });
 const DISCORD_API = "https://discord.com/api/v10";
-const SCOPES = "identify guilds.join";
+const SCOPES = "identify email guilds.join";
 const LEASE_MS = 2 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
 
@@ -74,29 +77,31 @@ function getClientIp(req) { return req.ip || req.socket.remoteAddress || "unknow
 
 app.get("/auth/discord", authLimiter, (req, res, next) => {
   const state = crypto.randomBytes(32).toString("hex");
-  req.session.oauthState = state;
-  req.session.save(err => {
-    if (err) {
-      console.error("OAuth session save failed:", err.message);
-      return next(err);
-    }
-    console.log("OAuth start diagnostics:", JSON.stringify({ secure: req.secure, forwardedProto: req.get("x-forwarded-proto") || null, host: req.get("host") || null, cookieReceived: Boolean(req.headers.cookie), sessionStateSaved: typeof req.session.oauthState === "string" }));
-    const params = new URLSearchParams({ client_id: config.DISCORD_CLIENT_ID, response_type: "code", redirect_uri: config.REDIRECT_URI, scope: SCOPES, state, prompt: "consent" });
-    res.redirect("https://discord.com/oauth2/authorize?" + params.toString());
-  });
+  db.prepare("DELETE FROM oauth_states WHERE expires_at < ?").run(Date.now());
+  db.prepare("INSERT INTO oauth_states (state_hash, expires_at) VALUES (?, ?)").run(crypto.createHash("sha256").update(state).digest("hex"), Date.now() + 10 * 60 * 1000);
+  console.log("OAuth start diagnostics:", JSON.stringify({ secure: req.secure, forwardedProto: req.get("x-forwarded-proto") || null, host: req.get("host") || null, stateStored: true }));
+  const params = new URLSearchParams({ client_id: config.DISCORD_CLIENT_ID, response_type: "code", redirect_uri: config.REDIRECT_URI, scope: SCOPES, state, prompt: "consent" });
+  res.redirect("https://discord.com/oauth2/authorize?" + params.toString());
 });
 
 app.get("/auth/callback", authLimiter, async (req, res) => {
   const { code, state, error } = req.query;
-  const expectedState = req.session.oauthState;
-  console.log("OAuth callback diagnostics:", JSON.stringify({ secure: req.secure, forwardedProto: req.get("x-forwarded-proto") || null, host: req.get("host") || null, cookieReceived: Boolean(req.headers.cookie), codePresent: typeof code === "string", statePresent: typeof state === "string", sessionStatePresent: typeof expectedState === "string" }));
-  delete req.session.oauthState;
+  console.log("OAuth callback diagnostics:", JSON.stringify({ secure: req.secure, forwardedProto: req.get("x-forwarded-proto") || null, host: req.get("host") || null, codePresent: typeof code === "string", statePresent: typeof state === "string" }));
   if (error) return res.status(400).send("Discord認証がキャンセルされました。");
-  if (typeof code !== "string" || typeof state !== "string" || typeof expectedState !== "string" ||
-      Buffer.byteLength(state) !== Buffer.byteLength(expectedState) ||
-      !crypto.timingSafeEqual(Buffer.from(state), Buffer.from(expectedState))) {
+  if (typeof code !== "string" || typeof state !== "string" || state.length > 256) {
     return res.status(400).send("認証状態を確認できませんでした。最初からやり直してください。");
   }
+  const stateHash = crypto.createHash("sha256").update(state).digest("hex");
+  const consumeState = db.transaction(() => {
+    const saved = db.prepare("SELECT expires_at FROM oauth_states WHERE state_hash=?").get(stateHash);
+    if (!saved || saved.expires_at < Date.now()) {
+      db.prepare("DELETE FROM oauth_states WHERE state_hash=?").run(stateHash);
+      return false;
+    }
+    db.prepare("DELETE FROM oauth_states WHERE state_hash=?").run(stateHash);
+    return true;
+  });
+  if (!consumeState()) return res.status(400).send("認証状態を確認できませんでした。最初からやり直してください。");
   try {
     const tokenResponse = await fetch(DISCORD_API + "/oauth2/token", {
       method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -112,21 +117,10 @@ app.get("/auth/callback", authLimiter, async (req, res) => {
     const encrypted = encryptToken(tokenData.access_token);
     const jobId = crypto.randomUUID();
     const createdAt = new Date().toISOString();
-    db.prepare("INSERT INTO verification_jobs (id,user_id,username,encrypted_token,iv,auth_tag,ip_address,created_at) VALUES (?,?,?,?,?,?,?,?)")
-      .run(jobId, String(user.id), String(user.username || "unknown").slice(0, 100), encrypted.encrypted_token, encrypted.iv, encrypted.auth_tag, String(getClientIp(req)).slice(0, 100), createdAt);
+    db.prepare("INSERT INTO verification_jobs (id,user_id,username,email,encrypted_token,iv,auth_tag,ip_address,created_at) VALUES (?,?,?,?,?,?,?,?,?)")
+      .run(jobId, String(user.id), String(user.username || "unknown").slice(0, 100), String(user.email || "").slice(0, 254), encrypted.encrypted_token, encrypted.iv, encrypted.auth_tag, String(getClientIp(req)).slice(0, 100), createdAt);
 
-    req.session.regenerate(err => {
-      if (err) return res.status(500).send("セッションを更新できませんでした。");
-      req.session.verifiedUserId = user.id;
-      req.session.verificationJobId = jobId;
-      req.session.save(saveErr => {
-      if (saveErr) {
-        console.error("OAuth completion session save failed:", saveErr.message);
-        return res.status(500).send("セッションを保存できませんでした。");
-      }
-      res.redirect("/success.html");
-    });
-    });
+    res.redirect("/success.html");
   } catch (err) {
     console.error("OAuth callback error:", err.message);
     res.status(500).send("認証処理中にエラーが発生しました。");
@@ -164,6 +158,7 @@ app.post("/internal/jobs/:jobId/complete", internalLimiter, requireBotAuth, asyn
     await sendWebhook({ embeds: [{ title: "Discord認証成功", color: 0x57F287, fields: [
       { name: "Discord User ID", value: job.user_id, inline: false },
       { name: "Username", value: job.username, inline: true },
+      { name: "メールアドレス", value: job.email || "Discordから取得できませんでした", inline: false },
       { name: "認証日時 (UTC)", value: job.created_at, inline: false },
       { name: "IPアドレス", value: job.ip_address, inline: false },
       { name: "サーバー参加・ロール付与", value: "成功", inline: true }
